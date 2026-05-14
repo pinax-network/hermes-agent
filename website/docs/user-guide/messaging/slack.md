@@ -354,6 +354,37 @@ When `true` (the default), each user in a shared channel gets their own isolated
 
 Set to `false` if you want a collaborative mode where the entire channel shares one conversation session. Be aware this means users share context growth and token costs, and one user's `/reset` clears the session for everyone.
 
+#### Incident channels / channel-wide sessions
+
+For incident channels (for example, channels created by incident.io) where
+Hermes should treat both top-level messages and Slack thread replies as one
+shared incident context, combine shared group sessions with Slack's channel
+session scope:
+
+```yaml
+group_sessions_per_user: false
+
+slack:
+  # Let Hermes process incident-channel messages without an @mention.
+  require_mention: false
+
+  # Post replies in the channel instead of creating a Slack thread.
+  reply_in_thread: false
+
+  # Key top-level messages and thread replies to one channel session.
+  session_scope: channel
+
+  # Strongly recommended: restrict this behavior to incident channels.
+  allowed_channels:
+    - C0123456789
+```
+
+With `session_scope: channel`, Slack channel messages use the channel session
+instead of per-thread sessions. This is useful when one Slack channel represents
+one incident, but it can grow context and token usage quickly. Invite Hermes at
+incident creation time; Hermes does not backfill messages that arrived before it
+was added to the channel.
+
 ### Mention & Trigger Behavior
 
 ```yaml

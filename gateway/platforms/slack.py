@@ -1936,8 +1936,9 @@ class SlackAdapter(BasePlatformAdapter):
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
 
         # Build thread_ts for session keying.
-        # In channels: fall back to ts so each top-level @mention starts a
-        #   new thread/session (the bot always replies in a thread).
+        # In channels: default to the legacy per-thread/per-message session
+        #   behavior.  When session_scope=channel, all channel messages
+        #   (including Slack thread replies) share one channel session.
         # In DMs: fall back to ts so each top-level DM reply thread gets
         #   its own session key (matching channel behavior). Set
         #   dm_top_level_threads_as_sessions: false in config to revert to
@@ -1947,7 +1948,15 @@ class SlackAdapter(BasePlatformAdapter):
             if not thread_ts and self._dm_top_level_threads_as_sessions():
                 thread_ts = ts
         else:
-            thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
+            event_thread_ts_raw = event.get("thread_ts")
+            if self._slack_session_scope() == "channel":
+                thread_ts = None
+            elif event_thread_ts_raw and event_thread_ts_raw != ts:
+                thread_ts = event_thread_ts_raw
+            elif self.config.extra.get("reply_in_thread", True):
+                thread_ts = ts
+            else:
+                thread_ts = None
 
         # In channels, respond if:
         #   0. Channel is in free_response_channels, OR require_mention is
@@ -2988,6 +2997,23 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
         return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _slack_session_scope(self) -> str:
+        """Return Slack channel session scoping mode.
+
+        ``thread`` preserves the historical behavior: Slack thread replies are
+        keyed by their thread root and top-level messages use either their own
+        ts (when reply_in_thread is true) or the channel session (when false).
+        ``channel`` keys every non-DM channel message to the channel session so
+        incident-style channels can accumulate one shared context.
+        """
+        configured = self.config.extra.get("session_scope")
+        if configured is None:
+            configured = os.getenv("SLACK_SESSION_SCOPE", "thread")
+        scope = str(configured).strip().lower()
+        if scope in {"thread", "channel"}:
+            return scope
+        return "thread"
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""

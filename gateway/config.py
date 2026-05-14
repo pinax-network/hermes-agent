@@ -815,6 +815,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
                 if "reply_in_thread" in platform_cfg:
                     bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
+                if "session_scope" in platform_cfg:
+                    bridged["session_scope"] = platform_cfg["session_scope"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "free_response_channels" in platform_cfg:
@@ -889,6 +891,8 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
                 if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
                     os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+                if "session_scope" in slack_cfg and not os.getenv("SLACK_SESSION_SCOPE"):
+                    os.environ["SLACK_SESSION_SCOPE"] = str(slack_cfg["session_scope"]).lower()
                 frc = slack_cfg.get("free_response_channels")
                 if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
                     if isinstance(frc, list):
