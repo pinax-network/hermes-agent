@@ -817,6 +817,16 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
                 if "session_scope" in platform_cfg:
                     bridged["session_scope"] = platform_cfg["session_scope"]
+                if plat == Platform.SLACK and "channel_context_on_mention" in platform_cfg:
+                    bridged["channel_context_on_mention"] = platform_cfg["channel_context_on_mention"]
+                if plat == Platform.SLACK and "channel_context_allowed_channels" in platform_cfg:
+                    bridged["channel_context_allowed_channels"] = platform_cfg["channel_context_allowed_channels"]
+                if plat == Platform.SLACK and "channel_context_max_messages" in platform_cfg:
+                    bridged["channel_context_max_messages"] = platform_cfg["channel_context_max_messages"]
+                if plat == Platform.SLACK and "channel_context_max_threads" in platform_cfg:
+                    bridged["channel_context_max_threads"] = platform_cfg["channel_context_max_threads"]
+                if plat == Platform.SLACK and "channel_context_max_thread_messages" in platform_cfg:
+                    bridged["channel_context_max_thread_messages"] = platform_cfg["channel_context_max_thread_messages"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "free_response_channels" in platform_cfg:

@@ -315,6 +315,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}                # channel_id → team_id
+        self._channel_name_cache: Dict[str, Tuple[str, float]] = {}
+        self._CHANNEL_NAME_CACHE_TTL = 300.0
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -2017,6 +2019,20 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        if (
+            is_mentioned
+            and not is_dm
+            and self._slack_channel_context_on_mention()
+            and await self._slack_channel_context_channel_allowed(channel_id, team_id)
+        ):
+            channel_context = await self._fetch_channel_context_for_mention(
+                channel_id=channel_id,
+                current_ts=ts,
+                team_id=team_id,
+            )
+            if channel_context:
+                text = channel_context + text
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
@@ -2763,6 +2779,105 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""
 
+    async def _fetch_channel_context_for_mention(
+        self,
+        channel_id: str,
+        current_ts: str,
+        team_id: str = "",
+    ) -> str:
+        """Fetch bounded channel history and thread replies for a mention turn.
+
+        This is opt-in and only used for explicitly mentioned channel messages.
+        It lets incident channels stay quiet during normal discussion while the
+        final ``@hermes summarize`` turn receives the prior channel transcript.
+        """
+        max_messages = self._slack_channel_context_max_messages()
+        max_threads = self._slack_channel_context_max_threads()
+        max_thread_messages = self._slack_channel_context_max_thread_messages()
+        if max_messages <= 0:
+            return ""
+
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_history(
+                channel=channel_id,
+                latest=current_ts,
+                inclusive=False,
+                limit=max_messages,
+            )
+            messages = result.get("messages", []) if result else []
+            if not messages:
+                return ""
+
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            lines: list[str] = []
+            fetched_threads = 0
+
+            async def _render_message(msg: dict, *, indent: str = "") -> Optional[str]:
+                text = (msg.get("text") or "").strip()
+                if not text:
+                    return None
+                if bot_uid:
+                    text = text.replace(f"<@{bot_uid}>", "").strip()
+                if not text:
+                    return None
+                user = msg.get("user") or msg.get("username") or "unknown"
+                name = await self._resolve_user_name(user, chat_id=channel_id)
+                ts = msg.get("ts", "")
+                return f"{indent}{ts} {name}: {text}"
+
+            for msg in sorted(messages, key=lambda m: m.get("ts", "")):
+                rendered = await _render_message(msg)
+                if rendered:
+                    lines.append(rendered)
+
+                reply_count = int(msg.get("reply_count") or 0)
+                thread_ts = msg.get("thread_ts") or msg.get("ts")
+                if (
+                    reply_count <= 0
+                    or not thread_ts
+                    or fetched_threads >= max_threads
+                    or max_thread_messages <= 0
+                ):
+                    continue
+
+                try:
+                    replies = await client.conversations_replies(
+                        channel=channel_id,
+                        ts=thread_ts,
+                        limit=max_thread_messages + 1,
+                        inclusive=True,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[Slack] Failed to fetch channel context thread %s: %s",
+                        thread_ts,
+                        exc,
+                    )
+                    continue
+
+                fetched_threads += 1
+                for reply in (replies.get("messages", []) if replies else []):
+                    reply_ts = reply.get("ts", "")
+                    if not reply_ts or reply_ts == msg.get("ts") or reply_ts == current_ts:
+                        continue
+                    rendered_reply = await _render_message(reply, indent="  ↳ ")
+                    if rendered_reply:
+                        lines.append(rendered_reply)
+
+            if not lines:
+                return ""
+
+            return (
+                "[Slack channel context — prior channel messages and fetched thread replies; "
+                "use as incident transcript context, do not quote secrets verbatim unless requested:]\n"
+                + "\n".join(lines)
+                + "\n[End of Slack channel context]\n\n"
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to fetch channel context: %s", e)
+            return ""
+
     async def _handle_slash_command(self, command: dict) -> None:
         """Handle Slack slash commands.
 
@@ -3014,6 +3129,101 @@ class SlackAdapter(BasePlatformAdapter):
         if scope in {"thread", "channel"}:
             return scope
         return "thread"
+
+    def _slack_channel_context_on_mention(self) -> bool:
+        """Return whether @mentions should include bounded channel history."""
+        configured = self.config.extra.get("channel_context_on_mention")
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            return configured.lower().strip() in {"true", "1", "yes", "on"}
+        return bool(configured)
+
+    def _slack_channel_context_allowed_channels(self) -> set:
+        """Return channel allowlist for channel-context fetches."""
+        raw = self.config.extra.get("channel_context_allowed_channels")
+        if raw is None:
+            return self._slack_allowed_channels()
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    async def _resolve_channel_name_for_context(self, channel_id: str, team_id: str = "") -> str:
+        """Resolve a Slack channel ID to a channel name for context allowlists."""
+        cache_key = f"{team_id}:{channel_id}"
+        now = time.monotonic()
+        cached = self._channel_name_cache.get(cache_key)
+        if cached and (now - cached[1]) < self._CHANNEL_NAME_CACHE_TTL:
+            return cached[0]
+
+        try:
+            result = await self._get_client(channel_id).conversations_info(channel=channel_id)
+            channel = result.get("channel", {}) if result else {}
+            name = str(channel.get("name") or "").lstrip("#").strip()
+            if name:
+                self._channel_name_cache[cache_key] = (name, now)
+            return name
+        except Exception as exc:
+            logger.debug("[Slack] Failed to resolve channel name for %s: %s", channel_id, exc)
+            return ""
+
+    async def _slack_channel_context_channel_allowed(self, channel_id: str, team_id: str = "") -> bool:
+        allowed = self._slack_channel_context_allowed_channels()
+        if not allowed:
+            return False
+        if channel_id in allowed:
+            return True
+
+        exact_names: list[str] = []
+        regex_patterns: list[str] = []
+        for raw_spec in allowed:
+            spec = str(raw_spec).strip()
+            if spec.startswith("#"):
+                name = spec[1:].strip()
+                if name:
+                    exact_names.append(name)
+            elif spec.startswith("regex:"):
+                pattern = spec[len("regex:"):].strip()
+                if pattern:
+                    regex_patterns.append(pattern)
+
+        if not exact_names and not regex_patterns:
+            return False
+
+        channel_name = await self._resolve_channel_name_for_context(channel_id, team_id)
+        if not channel_name:
+            return False
+        if channel_name in exact_names:
+            return True
+
+        for pattern in regex_patterns:
+            try:
+                if re.match(pattern, channel_name):
+                    return True
+            except re.error as exc:
+                logger.warning(
+                    "[Slack] Invalid channel_context_allowed_channels regex %r: %s",
+                    pattern,
+                    exc,
+                )
+        return False
+
+    def _slack_channel_context_int(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        raw = self.config.extra.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _slack_channel_context_max_messages(self) -> int:
+        return self._slack_channel_context_int("channel_context_max_messages", 200, 0, 1000)
+
+    def _slack_channel_context_max_threads(self) -> int:
+        return self._slack_channel_context_int("channel_context_max_threads", 50, 0, 200)
+
+    def _slack_channel_context_max_thread_messages(self) -> int:
+        return self._slack_channel_context_int("channel_context_max_thread_messages", 100, 0, 1000)
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""

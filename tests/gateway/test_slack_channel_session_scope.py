@@ -204,3 +204,190 @@ def test_slack_session_scope_config_bridge(tmp_path, monkeypatch):
 
     assert config.platforms[Platform.SLACK].extra["session_scope"] == "channel"
     assert os.environ["SLACK_SESSION_SCOPE"] == "channel"
+
+
+def test_slack_channel_context_config_bridge(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  channel_context_on_mention: true\n"
+        "  channel_context_allowed_channels:\n"
+        "    - C_INCIDENT\n"
+        "  channel_context_max_messages: 50\n"
+        "  channel_context_max_threads: 5\n"
+        "  channel_context_max_thread_messages: 20\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+
+    config = load_gateway_config()
+    slack_extra = config.platforms[Platform.SLACK].extra
+
+    assert slack_extra["channel_context_on_mention"] is True
+    assert slack_extra["channel_context_allowed_channels"] == ["C_INCIDENT"]
+    assert slack_extra["channel_context_max_messages"] == 50
+    assert slack_extra["channel_context_max_threads"] == 5
+    assert slack_extra["channel_context_max_thread_messages"] == 20
+
+
+@pytest.mark.asyncio
+async def test_channel_context_on_mention_injects_history_and_threads(adapter):
+    adapter.config.extra.update(
+        {
+            "session_scope": "channel",
+            "strict_mention": True,
+            "channel_context_on_mention": True,
+            "channel_context_allowed_channels": ["C_INCIDENT"],
+            "channel_context_max_messages": 10,
+            "channel_context_max_threads": 2,
+            "channel_context_max_thread_messages": 5,
+        }
+    )
+    adapter._app.client.conversations_history = AsyncMock(
+        return_value={
+            "messages": [
+                {"user": "U_TWO", "text": "mitigation deployed", "ts": "1700000002.000000"},
+                {
+                    "user": "U_ONE",
+                    "text": "incident started",
+                    "ts": "1700000001.000000",
+                    "reply_count": 1,
+                    "thread_ts": "1700000001.000000",
+                },
+            ]
+        }
+    )
+    adapter._app.client.conversations_replies = AsyncMock(
+        return_value={
+            "messages": [
+                {"user": "U_ONE", "text": "incident started", "ts": "1700000001.000000"},
+                {"user": "U_THREE", "text": "root cause found", "ts": "1700000001.000100"},
+            ]
+        }
+    )
+    adapter._resolve_user_name = AsyncMock(side_effect=lambda user_id, chat_id="": user_id)
+
+    event = _channel_event("<@U_BOT> incident resolved, write summary", ts="1700000003.000000")
+
+    captured = []
+    adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+    await adapter._handle_slack_message(event)
+    assert len(captured) == 1
+    msg_event = captured[0]
+
+    adapter._app.client.conversations_history.assert_awaited_once_with(
+        channel="C_INCIDENT",
+        latest="1700000003.000000",
+        inclusive=False,
+        limit=10,
+    )
+    adapter._app.client.conversations_replies.assert_awaited_once()
+    assert msg_event.source.thread_id is None
+    assert "[Slack channel context" in msg_event.text
+    assert "1700000001.000000 U_ONE: incident started" in msg_event.text
+    assert "↳ 1700000001.000100 U_THREE: root cause found" in msg_event.text
+    assert "1700000002.000000 U_TWO: mitigation deployed" in msg_event.text
+    assert msg_event.text.rstrip().endswith("incident resolved, write summary")
+
+
+@pytest.mark.asyncio
+async def test_channel_context_allowed_by_channel_id_without_name_lookup(adapter):
+    adapter.config.extra["channel_context_allowed_channels"] = ["C_INCIDENT"]
+    adapter._app.client.conversations_info = AsyncMock()
+
+    assert await adapter._slack_channel_context_channel_allowed("C_INCIDENT", "T1") is True
+    adapter._app.client.conversations_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_context_allowed_by_exact_channel_name(adapter):
+    adapter.config.extra["channel_context_allowed_channels"] = ["#inc-prod"]
+    adapter._app.client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "inc-prod"}}
+    )
+
+    assert await adapter._slack_channel_context_channel_allowed("C123", "T1") is True
+
+
+@pytest.mark.asyncio
+async def test_channel_context_allowed_by_channel_name_regex(adapter):
+    adapter.config.extra["channel_context_allowed_channels"] = ["regex:^inc-.*"]
+    adapter._app.client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "inc-prod"}}
+    )
+
+    assert await adapter._slack_channel_context_channel_allowed("C123", "T1") is True
+
+
+@pytest.mark.asyncio
+async def test_channel_context_regex_rejects_non_matching_name(adapter):
+    adapter.config.extra["channel_context_allowed_channels"] = ["regex:^inc-.*"]
+    adapter._app.client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "prod-inc"}}
+    )
+
+    assert await adapter._slack_channel_context_channel_allowed("C123", "T1") is False
+
+
+@pytest.mark.asyncio
+async def test_channel_context_invalid_regex_fails_closed(adapter):
+    adapter.config.extra["channel_context_allowed_channels"] = ["regex:["]
+    adapter._app.client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "inc-prod"}}
+    )
+
+    assert await adapter._slack_channel_context_channel_allowed("C123", "T1") is False
+
+
+@pytest.mark.asyncio
+async def test_channel_context_on_mention_accepts_regex_channel_name(adapter):
+    adapter.config.extra.update(
+        {
+            "session_scope": "channel",
+            "strict_mention": True,
+            "channel_context_on_mention": True,
+            "channel_context_allowed_channels": ["regex:^inc-.*"],
+            "channel_context_max_messages": 10,
+        }
+    )
+    adapter._app.client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "inc-prod"}}
+    )
+    adapter._app.client.conversations_history = AsyncMock(
+        return_value={
+            "messages": [
+                {"user": "U_ONE", "text": "incident started", "ts": "1700000001.000000"},
+            ]
+        }
+    )
+    adapter._app.client.conversations_replies = AsyncMock(return_value={"messages": []})
+    adapter._resolve_user_name = AsyncMock(side_effect=lambda user_id, chat_id="": user_id)
+    captured = []
+    adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+
+    await adapter._handle_slack_message(
+        _channel_event("<@U_BOT> incident resolved", ts="1700000002.000000")
+    )
+
+    adapter._app.client.conversations_history.assert_awaited_once()
+    assert len(captured) == 1
+    assert "incident started" in captured[0].text
+
+
+@pytest.mark.asyncio
+async def test_channel_context_not_fetched_for_unmentioned_strict_message(adapter):
+    adapter.config.extra.update(
+        {
+            "strict_mention": True,
+            "channel_context_on_mention": True,
+            "channel_context_allowed_channels": ["C_INCIDENT"],
+        }
+    )
+    adapter._app.client.conversations_history = AsyncMock(return_value={"messages": []})
+
+    await adapter._handle_slack_message(_channel_event("incident chatter", ts="1700000004.000000"))
+
+    adapter._app.client.conversations_history.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
