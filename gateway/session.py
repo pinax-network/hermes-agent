@@ -1325,6 +1325,16 @@ class SessionStore:
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
+
+    def prune_observed_transcript(self, session_id: str, max_messages: int) -> int:
+        """Prune old observed-only transcript rows for one session."""
+        if not self._db:
+            return 0
+        try:
+            return self._db.prune_observed_messages(session_id, max_messages)
+        except Exception as e:
+            logger.debug("Failed to prune observed transcript: %s", e)
+            return 0
     
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.

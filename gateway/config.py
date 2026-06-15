@@ -957,6 +957,16 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["exclusive_bot_mentions"] = platform_cfg["exclusive_bot_mentions"]
                 if plat == Platform.TELEGRAM and "observe_unmentioned_group_messages" in platform_cfg:
                     bridged["observe_unmentioned_group_messages"] = platform_cfg["observe_unmentioned_group_messages"]
+                if plat == Platform.SLACK:
+                    for _slack_observe_key in (
+                        "observe_unaddressed_channel_messages",
+                        "observed_persist_max_messages",
+                        "observed_message_max_chars",
+                        "observed_context_max_messages",
+                        "observed_context_max_chars",
+                    ):
+                        if _slack_observe_key in platform_cfg:
+                            bridged[_slack_observe_key] = platform_cfg[_slack_observe_key]
                 if "dm_policy" in platform_cfg:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:

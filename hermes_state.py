@@ -2459,6 +2459,62 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def prune_observed_messages(self, session_id: str, max_messages: int) -> int:
+        """Hard-delete old observed context rows for one session.
+
+        Observed rows are passive channel chatter, not agent turns. Pruning them
+        bounds persisted Slack/Telegram/Yuanbao context without touching normal
+        conversation messages.
+        """
+        try:
+            limit = int(max_messages)
+        except (TypeError, ValueError):
+            return 0
+        if limit < 0:
+            return 0
+
+        def _do(conn):
+            if limit == 0:
+                cursor = conn.execute(
+                    "DELETE FROM messages WHERE session_id = ? AND observed = 1",
+                    (session_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE session_id = ?
+                      AND observed = 1
+                      AND id NOT IN (
+                          SELECT id FROM messages
+                          WHERE session_id = ? AND observed = 1
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (session_id, session_id, limit),
+                )
+            deleted = int(cursor.rowcount or 0)
+            if deleted > 0:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET message_count = CASE
+                        WHEN message_count >= ? THEN message_count - ?
+                        ELSE 0
+                    END
+                    WHERE id = ?
+                    """,
+                    (deleted, deleted, session_id),
+                )
+            return deleted
+
+        try:
+            return int(self._execute_write(_do) or 0)
+        except Exception as exc:
+            logger.debug("Failed to prune observed messages for %s: %s", session_id, exc)
+            return 0
+
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.
 

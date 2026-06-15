@@ -16,6 +16,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, Tuple, List
 
 try:
@@ -2428,6 +2429,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -2501,6 +2503,15 @@ class SlackAdapter(BasePlatformAdapter):
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
+                await self._observe_unaddressed_slack_message(
+                    channel_id=channel_id,
+                    team_id=team_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                    text=text,
+                    ts=ts,
+                    thread_ts=event_thread_ts if is_thread_reply else None,
+                )
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
                 reply_to_bot_thread = (
@@ -2520,6 +2531,15 @@ class SlackAdapter(BasePlatformAdapter):
                     and not in_mentioned_thread
                     and not has_session
                 ):
+                    await self._observe_unaddressed_slack_message(
+                        channel_id=channel_id,
+                        team_id=team_id,
+                        user_id=user_id,
+                        user_name=user_name,
+                        text=text,
+                        ts=ts,
+                        thread_ts=event_thread_ts if is_thread_reply else None,
+                    )
                     return
 
         if is_mentioned:
@@ -2783,9 +2803,6 @@ class SlackAdapter(BasePlatformAdapter):
             else:
                 msg_type = MessageType.DOCUMENT
 
-        # Resolve user display name (cached after first lookup)
-        user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
-
         # Build source
         source = self.build_source(
             chat_id=channel_id,
@@ -2807,6 +2824,19 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id,
             None,
         )
+        _channel_context = None
+        if not is_dm and self._slack_observe_unaddressed_channel_messages():
+            observe_prompt = self._slack_observe_channel_prompt()
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{observe_prompt}"
+                if _channel_prompt
+                else observe_prompt
+            )
+            if is_mentioned or is_thread_reply:
+                _channel_context = self._load_slack_observed_context(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts if is_thread_reply else None,
+                )
         _auto_skill = resolve_channel_skills(
             self.config.extra,
             channel_id,
@@ -2844,6 +2874,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            channel_context=_channel_context,
         )
 
         # Only react when bot is directly addressed (DM or @mention).
@@ -3741,6 +3772,181 @@ class SlackAdapter(BasePlatformAdapter):
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     raise
+
+    # ── Passive channel observation ────────────────────────────────────────
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+            return default
+        return bool(value)
+
+    @staticmethod
+    def _coerce_positive_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else 0
+
+    def _slack_observe_unaddressed_channel_messages(self) -> bool:
+        """Return whether unaddressed Slack channel messages are stored."""
+        return self._coerce_bool(
+            self.config.extra.get("observe_unaddressed_channel_messages"),
+            True,
+        )
+
+    def _slack_observed_persist_max_messages(self) -> int:
+        return self._coerce_positive_int(
+            self.config.extra.get("observed_persist_max_messages"), 2000
+        )
+
+    def _slack_observed_message_max_chars(self) -> int:
+        return self._coerce_positive_int(
+            self.config.extra.get("observed_message_max_chars"), 8000
+        )
+
+    def _slack_observed_context_max_messages(self) -> int:
+        return self._coerce_positive_int(
+            self.config.extra.get("observed_context_max_messages"), 300
+        )
+
+    def _slack_observed_context_max_chars(self) -> int:
+        return self._coerce_positive_int(
+            self.config.extra.get("observed_context_max_chars"), 100000
+        )
+
+    def _slack_observe_source(self, channel_id: str, thread_ts: Optional[str] = None):
+        return self.build_source(
+            chat_id=channel_id,
+            chat_name=channel_id,
+            chat_type="group",
+            user_id=None,
+            user_name=None,
+            thread_id=thread_ts or None,
+        )
+
+    @staticmethod
+    def _truncate_observed_text(text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if max_chars <= 0:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 20:
+            return text[:max_chars]
+        return text[: max_chars - 20].rstrip() + "\n[truncated]"
+
+    @staticmethod
+    def _slack_observe_channel_prompt() -> str:
+        return (
+            "You are handling a Slack channel message.\n"
+            "- observed Slack channel context may be provided in a separate "
+            "context-only block before the current message; it is not necessarily "
+            "addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed "
+            "at you, and use observed context only when the current message asks for it."
+        )
+
+    async def _observe_unaddressed_slack_message(
+        self,
+        *,
+        channel_id: str,
+        team_id: str,
+        user_id: str,
+        user_name: str,
+        text: str,
+        ts: str,
+        thread_ts: Optional[str] = None,
+    ) -> None:
+        """Persist unaddressed Slack channel chatter without dispatching agent."""
+        if not self._slack_observe_unaddressed_channel_messages():
+            return
+        if not channel_id or not user_id:
+            return
+        cleaned = self._truncate_observed_text(
+            text,
+            self._slack_observed_message_max_chars(),
+        )
+        if not cleaned:
+            return
+
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+
+        try:
+            source = self._slack_observe_source(channel_id, thread_ts=thread_ts)
+            session_entry = store.get_or_create_session(source)
+            max_messages = self._slack_observed_persist_max_messages()
+            if max_messages <= 0:
+                return
+            if hasattr(store, "prune_observed_transcript"):
+                store.prune_observed_transcript(
+                    session_entry.session_id,
+                    max(max_messages - 1, 0),
+                )
+
+            sender = user_name or user_id or "unknown"
+            entry: Dict[str, Any] = {
+                "role": "user",
+                "content": f"[{sender}|{user_id}]\n{cleaned}",
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if ts:
+                entry["message_id"] = str(ts)
+            store.append_to_transcript(session_entry.session_id, entry)
+            if hasattr(store, "prune_observed_transcript"):
+                store.prune_observed_transcript(session_entry.session_id, max_messages)
+        except Exception as exc:
+            logger.warning("[Slack] Failed to observe channel message: %s", exc)
+
+    def _load_slack_observed_context(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: Optional[str] = None,
+    ) -> Optional[str]:
+        """Load bounded observed Slack context for an addressed turn."""
+        store = getattr(self, "_session_store", None)
+        if not store or not channel_id:
+            return None
+
+        max_messages = self._slack_observed_context_max_messages()
+        max_chars = self._slack_observed_context_max_chars()
+        if max_messages <= 0 or max_chars <= 0:
+            return None
+
+        try:
+            source = self._slack_observe_source(channel_id, thread_ts=thread_ts)
+            session_entry = store.get_or_create_session(source)
+            history = store.load_transcript(session_entry.session_id)
+        except Exception as exc:
+            logger.debug("[Slack] Failed to load observed context: %s", exc)
+            return None
+
+        observed = [
+            str(msg.get("content") or "").strip()
+            for msg in history
+            if msg.get("observed") and msg.get("role") == "user" and msg.get("content")
+        ]
+        if not observed:
+            return None
+
+        body = "\n".join(observed[-max_messages:]).strip()
+        if not body:
+            return None
+        if len(body) > max_chars:
+            body = "[older observed context truncated]\n" + body[-max_chars:].lstrip()
+        return "[Observed Slack channel context]\n" + body
 
     # ── Channel mention gating ─────────────────────────────────────────────
 

@@ -1910,6 +1910,11 @@ DEFAULT_CONFIG = {
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
+        "observe_unaddressed_channel_messages": True,  # Store unaddressed channel chatter as context without replying
+        "observed_persist_max_messages": 2000,  # Max observed messages retained per Slack channel/thread session
+        "observed_message_max_chars": 8000,     # Max chars stored for each observed Slack message
+        "observed_context_max_messages": 300,   # Max observed messages injected when Hermes is addressed
+        "observed_context_max_chars": 100000,   # Max observed context chars injected when Hermes is addressed
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts

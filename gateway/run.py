@@ -611,8 +611,11 @@ def _build_replay_entry(role: str, content: Any, msg: Dict[str, Any]) -> Dict[st
     return entry
 
 
-_TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_OBSERVED_CONTEXT_PROMPT_MARKERS = (
+    "observed Telegram group context",
+    "observed Slack channel context",
+)
+_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed channel context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
 
 
@@ -627,7 +630,10 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     and unit-testable.
     """
 
-    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+    return bool(
+        channel_prompt
+        and any(marker in channel_prompt for marker in _OBSERVED_CONTEXT_PROMPT_MARKERS)
+    )
 
 
 def _build_gateway_agent_history(
